@@ -1,0 +1,421 @@
+#!/usr/bin/env bash
+# **************************************************************************** #
+#   mini-moulinette 2 — test your 42 Piscine C exercises before you push.      #
+#   Run `mini --help` for usage.                                               #
+# **************************************************************************** #
+
+VERSION="2.0.0"
+
+# ---------------------------------------------------------------- paths ----- #
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+	DIR_="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+	SOURCE="$(readlink "$SOURCE")"
+	case "$SOURCE" in /*) ;; *) SOURCE="$DIR_/$SOURCE" ;; esac
+done
+ROOT="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+TESTS="$ROOT/tests"
+FRAMEWORK="$ROOT/framework"
+
+# --------------------------------------------------------------- colors ----- #
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+	C_OK=$'\033[1;32m'; C_KO=$'\033[1;31m'; C_WARN=$'\033[33m'; C_DIM=$'\033[90m'
+	C_HEAD=$'\033[1;35m'; C_BOLD=$'\033[1m'; C_RST=$'\033[0m'; MM_COLOR=1
+else
+	C_OK=""; C_KO=""; C_WARN=""; C_DIM=""; C_HEAD=""; C_BOLD=""; C_RST=""; MM_COLOR=0
+fi
+
+say()  { printf '%s\n' "$*"; }
+die()  { printf '%s\n' "${C_KO}error:${C_RST} $*" >&2; exit 2; }
+
+usage() {
+	cat <<EOF
+${C_BOLD}mini-moulinette $VERSION${C_RST} — test your Piscine C exercises before you push.
+
+${C_BOLD}Usage${C_RST}
+  mini [day] [exercises...] [options]
+
+  Run it from your day folder (e.g. ~/piscine/C04) and it finds everything:
+    mini                  test every exercise of the day
+    mini ex03             test only ex03 (also: mini 3, mini ex03 ex05)
+    mini C04              say the day yourself if the folder isn't named C04
+    (inside C04/ex03)     mini   tests just that exercise
+
+${C_BOLD}Options${C_RST}
+  -v, --verbose      show every passing case too, not only failures
+  -n, --no-norm      skip norminette
+  -a, --no-asan      don't use AddressSanitizer (faster, misses memory bugs)
+  -t, --timeout SEC  time limit per test case (default 3)
+  -d, --dir PATH     test the day folder at PATH instead of the current one
+  -l, --list         list the days and exercises that have tests
+  -u, --update       update mini-moulinette (git pull)
+  -h, --help         show this help
+
+${C_BOLD}Reading the results${C_RST}
+  ${C_KO}x${C_RST} a required case failed      -> the exercise is KO
+  ${C_WARN}!${C_RST} an extra edge case failed  -> a warning only (often undefined by the
+                                subject, but worth knowing about)
+EOF
+}
+
+# reads "// mm:<key> value" lines at the top of a test.c
+meta() { sed -n "s#^// mm:$1[[:space:]]*##p" "$2"; }
+load_meta() { # load_meta test_dir
+	FILES="$(meta files "$1/test.c" | tr '\n' ' ' | sed 's/ *$//')"
+	ALLOWED="$(meta allowed "$1/test.c" | tr '\n' ' ' | sed 's/ *$//')"
+	TYPE="$(meta type "$1/test.c")"; TYPE="${TYPE:-func}"
+	PROTO="$(meta proto "$1/test.c")"
+}
+
+list_tests() {
+	local day ex FILES ALLOWED TYPE PROTO
+	for day in "$TESTS"/C*; do
+		printf '%s%s%s ' "$C_BOLD" "$(basename "$day")" "$C_RST"
+		for ex in "$day"/ex*; do
+			load_meta "$ex"; files="$FILES"
+			printf '%s%s%s:%s ' "$C_DIM" "$(basename "$ex")" "$C_RST" "$files"
+		done
+		printf '\n'
+	done
+}
+
+# ---------------------------------------------------------------- args ------ #
+DAY=""
+EXS=""
+VERBOSE=0
+NORM=1
+ASAN=1
+TIMEOUT=3
+DIR="$PWD"
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-h|--help) usage; exit 0 ;;
+		--version) say "mini-moulinette $VERSION"; exit 0 ;;
+		-v|--verbose) VERBOSE=1 ;;
+		-n|--no-norm) NORM=0 ;;
+		-a|--no-asan) ASAN=0 ;;
+		-t|--timeout) shift; TIMEOUT="$1"
+			case "$TIMEOUT" in ''|*[!0-9]*) die "--timeout needs a number of seconds" ;; esac ;;
+		-d|--dir) shift; [ -d "${1:-}" ] || die "no such directory: ${1:-}"; DIR="$(cd "$1" && pwd)" ;;
+		-l|--list) list_tests; exit 0 ;;
+		-u|--update) git -C "$ROOT" pull --ff-only; exit $? ;;
+		[Cc][0-9][0-9]) DAY="C${1#?}" ;;
+		ex[0-9][0-9]) EXS="$EXS $1" ;;
+		[0-9]) EXS="$EXS ex0$1" ;;
+		[0-9][0-9]) EXS="$EXS ex$1" ;;
+		*) die "unknown argument '$1' (try: mini --help)" ;;
+	esac
+	shift
+done
+
+# Started inside an exNN folder? Test just that exercise.
+case "$(basename "$DIR")" in
+	ex[0-9][0-9])
+		[ -z "$EXS" ] && EXS=" $(basename "$DIR")"
+		DIR="$(dirname "$DIR")" ;;
+esac
+
+if [ -z "$DAY" ]; then
+	base="$(basename "$DIR")"
+	if [[ "$base" =~ ^[Cc]([0-9][0-9]) ]]; then
+		DAY="C${BASH_REMATCH[1]}"
+	else
+		die "can't tell which day this is from the folder name '$base'.
+       Run mini inside your C00..C08 folder, or say the day: mini C04"
+	fi
+fi
+
+if [ ! -d "$TESTS/$DAY" ]; then
+	say "${C_KO}No tests for $DAY yet.${C_RST} Available: $(cd "$TESTS" && echo C*)"
+	exit 2
+fi
+
+for ex in $EXS; do
+	[ -d "$TESTS/$DAY/$ex" ] || die "$DAY has no $ex (it has: $(cd "$TESTS/$DAY" && echo ex*))"
+done
+
+# -------------------------------------------------------------- toolchain --- #
+CC="${CC:-cc}"
+command -v "$CC" >/dev/null 2>&1 || die "compiler '$CC' not found"
+command -v nm >/dev/null 2>&1 || NM_MISSING=1
+
+BUILD="$(mktemp -d "${TMPDIR:-/tmp}/mini-moul.XXXXXX")" || die "can't create a temp folder"
+cleanup() { rm -rf "$BUILD"; }
+trap cleanup EXIT
+trap 'printf "\n%sInterrupted.%s\n" "$C_WARN" "$C_RST"; exit 130' INT TERM
+
+# $CC compiles your code with the real flags (like the moulinette).
+# $TCC builds the tester; it may differ if only another compiler has ASan.
+TCC="$CC"
+SAN_FLAGS=""
+has_asan() {
+	command -v "$1" >/dev/null 2>&1 \
+		&& "$1" -fsanitize=address "$BUILD/probe.c" -o "$BUILD/probe" >/dev/null 2>&1 \
+		&& "$BUILD/probe" >/dev/null 2>&1
+}
+if [ "$ASAN" = 1 ]; then
+	printf 'int main(void){return 0;}\n' > "$BUILD/probe.c"
+	for c in "$CC" gcc clang; do
+		if has_asan "$c"; then TCC="$c"; break; fi
+	done
+	if [ "$TCC" != "$CC" ] || has_asan "$CC"; then
+		SAN_FLAGS="-fsanitize=address -fno-omit-frame-pointer"
+	else
+		ASAN=0
+		ASAN_NOTE="AddressSanitizer isn't available here, so memory bugs (like a missing +1 in malloc) are only caught if they crash."
+	fi
+fi
+export ASAN_OPTIONS="detect_leaks=0:exitcode=86:allocator_may_return_null=1:${ASAN_OPTIONS:-}"
+
+HAS_NORM=0
+if [ "$NORM" = 1 ] && command -v norminette >/dev/null 2>&1; then HAS_NORM=1; fi
+
+UNAME="$(uname -s)"
+
+# ---------------------------------------------------------------- header ---- #
+printf '\n%s mini-moulinette %s %s %s%s%s\n' "$C_HEAD" "$C_RST" "$C_BOLD$DAY$C_RST" "$C_DIM" "$DIR" "$C_RST"
+notes=""
+[ "$NORM" = 1 ] && [ "$HAS_NORM" = 0 ] && notes="$notes  norminette not found: norm is NOT checked.\n"
+[ "$NORM" = 0 ] && notes="$notes  norm check skipped (--no-norm).\n"
+[ -n "${ASAN_NOTE:-}" ] && notes="$notes  $ASAN_NOTE\n"
+[ -n "${NM_MISSING:-}" ] && notes="$notes  'nm' not found: forbidden functions are NOT checked.\n"
+[ -n "$notes" ] && printf '%s' "$C_WARN" && printf "$notes" && printf '%s' "$C_RST"
+printf '\n'
+
+# ------------------------------------------------------------- helpers ------ #
+DETAILS=""
+add() { DETAILS="$DETAILS$1"$'\n'; }
+add_block() { # indent a block of text
+	local line n=0 max="${2:-12}"
+	while IFS= read -r line; do
+		n=$((n + 1))
+		if [ "$n" -gt "$max" ]; then add "        ${C_DIM}...${C_RST}"; break; fi
+		add "        ${C_DIM}${line}${C_RST}"
+	done <<EOF
+$1
+EOF
+}
+
+in_list() { # in_list word "list of words"
+	local w
+	for w in $2; do [ "$w" = "$1" ] && return 0; done
+	return 1
+}
+
+undefined_symbols() { # functions an object file calls but doesn't define
+	nm -u "$1" 2>/dev/null | awk '{print $NF}' | while read -r s; do
+		[ "$UNAME" = Darwin ] && s="${s#_}"
+		case "$s" in   # libc internals that ctype.h / fortify macros expand to
+			__ctype_b_loc|__maskrune|___runetype|__istype|__isctype) s="isalpha/isspace/...(ctype.h)" ;;
+			__ctype_tolower_loc|__tolower) s="tolower" ;;
+			__ctype_toupper_loc|__toupper) s="toupper" ;;
+			__printf_chk|__fprintf_chk|__sprintf_chk|__snprintf_chk) s="${s#__}"; s="${s%_chk}" ;;
+			__strcpy_chk|__strcat_chk|__memcpy_chk|__memset_chk|__strncpy_chk) s="${s#__}"; s="${s%_chk}" ;;
+			__isoc99_*|__isoc23_*) s="${s#__isoc[0-9][0-9]_}" ;;
+		esac
+		case "$s" in _*|''|stdout|stderr|stdin|errno|environ) ;; *) printf '%s\n' "$s" ;; esac
+	done | sort -u
+}
+
+# Fills STATUS (OK / KO / MISSING), SCORE ("3/4"), WARNS, NORM_FAIL.
+run_exercise() {
+	local ex="$1" tdir="$TESTS/$DAY/$1" sdir="$DIR/$1" b="$BUILD/$1"
+	local FILES="" ALLOWED="" TYPE="func" PROTO="" f missing="" extra="" log
+	local srcs="" objs="" forb="" defined="" sym out res pass total warn
+	load_meta "$tdir"
+	mkdir -p "$b"
+	STATUS=KO; SCORE=""; WARNS=0; NORM_FAIL=0; DETAILS=""
+
+	if [ ! -d "$sdir" ]; then
+		STATUS=MISSING; add "        ${C_DIM}no $ex folder${C_RST}"; return
+	fi
+	for f in $FILES; do
+		[ -f "$sdir/$f" ] || missing="$missing $f"
+	done
+	if [ -n "$missing" ]; then
+		add "        missing file:$missing"
+		add "        ${C_DIM}found in $ex/: $(cd "$sdir" && ls -A | tr '\n' ' ')${C_RST}"
+		return
+	fi
+	for f in "$sdir"/* "$sdir"/.[!.]*; do
+		[ -e "$f" ] || continue
+		in_list "$(basename "$f")" "$FILES" || extra="$extra $(basename "$f")"
+	done
+	if [ -n "$extra" ]; then
+		WARNS=$((WARNS + 1))
+		add "    ${C_WARN}! extra file(s) in $ex/:$extra (only $FILES should be pushed)${C_RST}"
+	fi
+
+	# --- norminette
+	if [ "$HAS_NORM" = 1 ]; then
+		out="$(cd "$sdir" && norminette $FILES 2>&1)"
+		if printf '%s\n' "$out" | grep -q 'Error'; then
+			NORM_FAIL=1
+			add "    ${C_KO}x norminette${C_RST}"
+			add_block "$(printf '%s\n' "$out" | grep -v ': OK!$' | grep -v '^Notice')" 10
+		fi
+	fi
+
+	# --- compile with the real flags
+	if [ -n "$PROTO" ]; then
+		printf '#ifndef MM_PROTO_H\n# define MM_PROTO_H\n%s\n#endif\n' "$PROTO" > "$b/proto.h"
+	fi
+	for f in $FILES; do
+		case "$f" in *.c) ;; *) continue ;; esac
+		srcs="$srcs $sdir/$f"
+		log="$("$CC" -Wall -Wextra -Werror ${PROTO:+-include "$b/proto.h"} -I"$tdir" \
+			-c "$sdir/$f" -o "$b/${f%.c}.o" 2>&1)"
+		if [ $? -ne 0 ]; then
+			add "    ${C_KO}x does not compile with -Wall -Wextra -Werror${C_RST}"
+			if printf '%s' "$log" | grep -qE 'conflicting types|static declaration of .* follows'; then
+				add "        ${C_WARN}your prototype doesn't match the subject. Expected:${C_RST}"
+				add_block "$(printf '%s\n' "$PROTO" | grep -v '^#')" 6
+			fi
+			add_block "$(printf '%s\n' "$log" | sed "s#$sdir/##g; s#$b/##g")" 14
+			return
+		fi
+		objs="$objs $b/${f%.c}.o"
+	done
+
+	if [ -n "$objs" ] && [ -z "${NM_MISSING:-}" ]; then
+		# a main() in a function exercise breaks the moulinette's own main
+		if [ "$TYPE" != prog ] && nm $objs 2>/dev/null | grep -qE ' T _?main$'; then
+			add "    ${C_KO}x your file contains a main() — remove it before pushing${C_RST}"
+			return
+		fi
+		# functions defined in the student's own files are fine to call
+		defined="$(nm $objs 2>/dev/null | awk 'NF == 3 && $2 ~ /^[TtDdBbRrSsCc]$/ {print $3}' \
+			| sed "$([ "$UNAME" = Darwin ] && echo 's/^_//')" | tr '\n' ' ')"
+		for f in $objs; do
+			for sym in $(undefined_symbols "$f"); do
+				in_list "$sym" "$ALLOWED" || in_list "$sym" "$defined" || in_list "$sym" "$forb" \
+					|| forb="$forb $sym"
+			done
+		done
+		if [ -n "$forb" ]; then
+			if [ -z "$(printf '%s\n' $forb | grep -vE '^(memset|memcpy|memmove)$')" ]; then
+				WARNS=$((WARNS + 1))
+				add "    ${C_WARN}! calls$forb — fine if the compiler added it (e.g. char buf[100] = {0}), forbidden if you wrote it${C_RST}"
+			else
+				add "    ${C_KO}x forbidden function(s):$forb${C_RST}"
+				add "        ${C_DIM}allowed here: ${ALLOWED:-none}${C_RST}"
+				return
+			fi
+		fi
+	fi
+
+	# --- build the tester
+	case "$TYPE" in
+		func)
+			log="$("$TCC" -g $SAN_FLAGS -w ${PROTO:+-include "$b/proto.h"} -I"$b" -I"$FRAMEWORK" \
+				-I"$tdir" "$tdir/test.c" $srcs -o "$b/test" 2>&1)" ;;
+		prog)
+			log="$("$TCC" -g $SAN_FLAGS -w $srcs -o "$b/prog" 2>&1)" && \
+			log="$("$TCC" -g -w -I"$FRAMEWORK" -I"$tdir" "$tdir/test.c" -o "$b/test" 2>&1)" ;;
+		header)
+			log="$("$CC" -Wall -Wextra -Werror -I"$sdir" -I"$FRAMEWORK" -I"$tdir" -fsyntax-only \
+				"$tdir/test.c" 2>&1)" && \
+			log="$("$TCC" -g $SAN_FLAGS -w -I"$sdir" -I"$FRAMEWORK" -I"$tdir" \
+				"$tdir/test.c" -o "$b/test" 2>&1)" ;;
+	esac
+	if [ $? -ne 0 ]; then
+		sym="$(printf '%s\n' "$log" | grep -oE "undefined reference to \`[^']+'|\"_[a-z_0-9]+\", referenced" \
+			| sed -E "s/undefined reference to \`//; s/'$//; s/^\"_//; s/\", referenced//" | sort -u | tr '\n' ' ')"
+		if [ -n "$sym" ]; then
+			add "    ${C_KO}x function not found: $sym(check the name and spelling)${C_RST}"
+		elif [ "$TYPE" = header ]; then
+			add "    ${C_KO}x $FILES doesn't work with the subject's code${C_RST}"
+			undecl="$(printf '%s\n' "$log" | grep -oE "(implicit declaration of|call to undeclared) function '[^']+'" \
+				| sed -E "s/.*'([^']+)'/\\1/" | sort -u)"
+			for name in $undecl; do
+				if [ "$name" = write ]; then
+					add "        ${C_WARN}write() is undeclared: $FILES must #include <unistd.h>${C_RST}"
+				else
+					add "        ${C_WARN}no prototype for $name() in $FILES${C_RST}"
+				fi
+			done
+			for name in $(printf '%s\n' "$log" | grep -oE "conflicting types for '[^']+'" \
+				| sed -E "s/.*'([^']+)'/\\1/" | sort -u); do
+				[ "$name" = write ] || add "        ${C_WARN}wrong prototype for $name() in $FILES${C_RST}"
+			done
+			for name in $(printf '%s\n' "$log" | grep -oE "(use of undeclared identifier '[^']+')|('[A-Za-z_0-9]+' undeclared)" \
+				| grep -oE "'[^']+'" | tr -d "'" | sort -u); do
+				add "        ${C_WARN}$name is not defined in $FILES${C_RST}"
+			done
+			for name in $(printf '%s\n' "$log" | grep -oE "unknown type name '[^']+'" | grep -oE "'[^']+'" | tr -d "'" | sort -u); do
+				add "        ${C_WARN}type $name is not defined in $FILES${C_RST}"
+			done
+			for name in $(printf '%s\n' "$log" | grep -oE "no member named '[^']+'" | grep -oE "'[^']+'" | tr -d "'" | sort -u); do
+				add "        ${C_WARN}the struct has no field named $name${C_RST}"
+			done
+			add_block "$(printf '%s\n' "$log" | grep -E 'error' | grep -v 'all warnings' | sed "s#$sdir/##g; s#$tdir/##g; s#$FRAMEWORK/##g")" 4
+		else
+			add "    ${C_KO}x does not compile with the tester${C_RST}"
+			add_block "$(printf '%s\n' "$log" | sed "s#$sdir/##g; s#$tdir/##g")" 14
+		fi
+		return
+	fi
+
+	# --- run
+	out="$(cd "$b" && MM_COLOR="$MM_COLOR" MM_VERBOSE="$VERBOSE" MM_TIMEOUT="$TIMEOUT" \
+		MM_SRC_DIR="$sdir" MM_PROG="$b/prog" "$b/test" 2>"$b/stderr")"
+	res="$(printf '%s\n' "$out" | grep '^@@RESULT ' | tail -n 1)"
+	out="$(printf '%s\n' "$out" | grep -v '^@@RESULT ')"
+	[ -n "$out" ] && DETAILS="$DETAILS$out"$'\n'
+	if [ -z "$res" ]; then
+		add "    ${C_KO}x the tester itself crashed${C_RST}"
+		add_block "$(tail -n 5 "$b/stderr")" 5
+		return
+	fi
+	set -- $res
+	pass="$2"; total="$3"; warn="$4"
+	WARNS=$((WARNS + warn))
+	SCORE="$pass/$total"
+	if [ "$pass" = "$total" ] && [ "$NORM_FAIL" = 0 ]; then STATUS=OK; fi
+}
+
+# ---------------------------------------------------------------- main ------ #
+START=$(date +%s)
+ALL_EX="$(cd "$TESTS/$DAY" && echo ex*)"
+[ -z "$EXS" ] && EXS="$ALL_EX" && FULL_RUN=1
+n_ok=0; n_total=0; streak=1; graded=0; first_ko=""; any_norm=0; failed_list=""
+
+for ex in $ALL_EX; do
+	in_list "$ex" "$EXS" || continue
+	load_meta "$TESTS/$DAY/$ex"; files="$FILES"
+	run_exercise "$ex"
+	n_total=$((n_total + 1))
+	[ "$NORM_FAIL" = 1 ] && any_norm=1
+	case "$STATUS" in
+		OK) tag="${C_OK} OK ${C_RST}"; n_ok=$((n_ok + 1)); [ "$streak" = 1 ] && graded=$((graded + 1)) ;;
+		MISSING) tag="${C_DIM} -- ${C_RST}"; streak=0; [ -z "$first_ko" ] && first_ko="$ex"; failed_list="$failed_list $ex" ;;
+		*) tag="${C_KO} KO ${C_RST}"; streak=0; [ -z "$first_ko" ] && first_ko="$ex"; failed_list="$failed_list $ex" ;;
+	esac
+	extra=""
+	[ -n "$SCORE" ] && extra="${C_DIM}$SCORE cases${C_RST}"
+	[ "$WARNS" -gt 0 ] && extra="$extra ${C_WARN}$WARNS warning$([ "$WARNS" -gt 1 ] && echo s)${C_RST}"
+	printf '  %s %s  %-34s %s\n' "$tag" "$C_BOLD$ex$C_RST" "$files" "$extra"
+	[ -n "$DETAILS" ] && printf '%s' "$DETAILS"
+done
+
+ELAPSED=$(( $(date +%s) - START ))
+printf '\n  %s\n' "${C_DIM}────────────────────────────────────────────────────${C_RST}"
+if [ "$n_ok" = "$n_total" ]; then c="$C_OK"; else c="$C_KO"; fi
+printf '  Passed   %s%d/%d%s exercises%s\n' "$c" "$n_ok" "$n_total" "$C_RST" \
+	"$([ -n "$failed_list" ] && printf '   (KO:%s)' "$failed_list")"
+if [ -n "${FULL_RUN:-}" ]; then
+	grade=$(( 100 * graded / n_total ))
+	if [ "$any_norm" = 1 ]; then
+		grade=0; why="a norm error gives 0 for the whole day"
+	elif [ -n "$first_ko" ]; then
+		why="moulinette stops counting at the first KO ($first_ko)"
+	else
+		why="everything passed"
+	fi
+	if [ "$grade" -ge 50 ]; then c="$C_OK"; else c="$C_KO"; fi
+	printf '  Grade    %s%d/100%s  %s%s%s\n' "$c" "$grade" "$C_RST" "$C_DIM" "$why" "$C_RST"
+fi
+printf '  %sdone in %ss — mini-moulinette is not the real moulinette, think about your own edge cases too.%s\n\n' "$C_DIM" "$ELAPSED" "$C_RST"
+
+[ "$n_ok" = "$n_total" ]
